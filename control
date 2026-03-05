@@ -1,0 +1,9 @@
+Package: preferenceloader
+Name: PreferenceLoader
+Version: 3.0.0
+Architecture: iphoneos-arm64
+Description: load preferences in style
+Maintainer: ygzo
+Author: ygzo
+Section: System
+Depends: mobilesubstrate | ellekit | substitute | org.coolstar.libhooker

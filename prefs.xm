@@ -495,9 +495,11 @@ static void pl_lazyLoadBundleCore(id self, SEL _cmd, PSSpecifier *specifier, voi
 		%init(Firmware_ge_60);
 	}
 
-	if (!ROOTLESS) {
+	#if defined(ROOTLESS) && ROOTLESS
+		// Rootless builds should skip this rootful compatibility hook.
+	#else
 		%init(Rootful);
-	}
+	#endif
 
 	void *preferencesHandle = dlopen("/System/Library/PrivateFrameworks/Preferences.framework/Preferences", RTLD_LAZY | RTLD_NOLOAD);
 	if(preferencesHandle) {

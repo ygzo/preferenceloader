@@ -1,6 +1,7 @@
 #import <Preferences/Preferences.h>
 #import <substrate.h>
 #import <dlfcn.h>
+#import <objc/runtime.h>
 
 #import "prefs.h"
 
@@ -20,133 +21,251 @@ static NSString **pPSTableCellUseEtchedAppearanceKey = NULL;
 
 /* {{{ Locals */
 static BOOL _Firmware_lt_60 = NO;
-/* }}} */
-
-%hook PrefsListController
+static BOOL _UseTopLevelFallbackDetection = NO;
 static NSMutableArray *_loadedSpecifiers = nil;
 static NSInteger _extraPrefsGroupSectionID = 0;
+static const void *PLDidInjectKey = &PLDidInjectKey;
+/* }}} */
+
+static NSString *PLPreferenceLoaderEntriesPath(void) {
+#if SIMULATOR
+	return @"/opt/simject/PreferenceLoader/Preferences";
+#else
+	return @"/var/jb/Library/PreferenceLoader/Preferences";
+#endif
+}
+
+static NSInteger PSSpecifierSort(PSSpecifier *a1, PSSpecifier *a2, void *context) {
+#pragma unused(context)
+	NSString *name1 = [a1 name] ?: @"";
+	NSString *name2 = [a2 name] ?: @"";
+	return [name1 localizedCaseInsensitiveCompare:name2];
+}
+
+static BOOL PLShouldApplyEtchedAppearance(void) {
+	if(!pPSTableCellUseEtchedAppearanceKey)
+		return NO;
+	if(![UIDevice instancesRespondToSelector:@selector(isWildcat)])
+		return NO;
+	return [[UIDevice currentDevice] isWildcat];
+}
+
+static void PLApplyEtchedAppearanceToSpecifiers(NSArray *specifiers) {
+	if(!PLShouldApplyEtchedAppearance())
+		return;
+
+	for(PSSpecifier *specifier in specifiers) {
+		[specifier setProperty:@YES forKey:*pPSTableCellUseEtchedAppearanceKey];
+	}
+}
+
+static BOOL PLLooksLikeTopLevelSettingsController(PSListController *controller) {
+	// Root controllers commonly have no parent, and rootController may be self or nil.
+	if([controller respondsToSelector:@selector(parentController)] &&
+	   [controller respondsToSelector:@selector(rootController)]) {
+		id parentController = [controller parentController];
+		id rootController = [controller rootController];
+		if(parentController == nil && (rootController == nil || rootController == controller))
+			return YES;
+	}
+
+	// Fallback heuristic for unknown controller classes.
+	if([controller respondsToSelector:@selector(specifier)] && [controller specifier] == nil) {
+		NSString *className = NSStringFromClass([controller class]);
+		if([className rangeOfString:@"Root" options:NSCaseInsensitiveSearch].location != NSNotFound)
+			return YES;
+		if([className rangeOfString:@"Settings" options:NSCaseInsensitiveSearch].location != NSNotFound)
+			return YES;
+		if([className rangeOfString:@"General" options:NSCaseInsensitiveSearch].location != NSNotFound)
+			return YES;
+	}
+
+	return NO;
+}
+
+static NSMutableArray *PLLoadExtraSpecifiersForController(PSListController *controller) {
+	NSString *basePath = PLPreferenceLoaderEntriesPath();
+	NSArray *subpaths = [[NSFileManager defaultManager] subpathsOfDirectoryAtPath:basePath error:NULL];
+	if(subpaths.count == 0)
+		return [NSMutableArray array];
+
+	NSMutableArray *result = [NSMutableArray array];
+	for(NSString *item in subpaths) {
+		if(![[item pathExtension] isEqualToString:@"plist"])
+			continue;
+
+		NSString *fullPath = [basePath stringByAppendingPathComponent:item];
+		NSDictionary *plPlist = [NSDictionary dictionaryWithContentsOfFile:fullPath];
+		if(!plPlist)
+			continue;
+
+		NSDictionary *topLevelFilter = [plPlist objectForKey:@"filter"] ?: [plPlist objectForKey:PLFilterKey];
+		if(![PSSpecifier environmentPassesPreferenceLoaderFilter:topLevelFilter])
+			continue;
+
+		NSDictionary *entry = [plPlist objectForKey:@"entry"];
+		if(!entry)
+			continue;
+		if(![PSSpecifier environmentPassesPreferenceLoaderFilter:[entry objectForKey:PLFilterKey]])
+			continue;
+
+		NSString *title = [[item lastPathComponent] stringByDeletingPathExtension];
+		NSString *sourceBundlePath = [fullPath stringByDeletingLastPathComponent];
+		NSArray *specifiers = [controller specifiersFromEntry:entry
+							 sourcePreferenceLoaderBundlePath:sourceBundlePath
+								 title:title];
+		if(specifiers.count == 0)
+			continue;
+
+		PLApplyEtchedAppearanceToSpecifiers(specifiers);
+		[result addObjectsFromArray:specifiers];
+	}
+
+	[result sortUsingFunction:(NSInteger (*)(id, id, void *))&PSSpecifierSort context:NULL];
+	return result;
+}
+
+static NSInteger PLInsertionIndexForController(PSListController *controller, NSArray *specifiers) {
+	NSInteger group = 0;
+	NSInteger row = 0;
+	if([controller getGroup:&group row:&row ofSpecifierID:_Firmware_lt_60 ? @"General" : @"TWITTER"]) {
+		NSInteger index = [controller indexOfGroup:group] + [[controller specifiersInGroup:group] count];
+		PLLog(@"Inserting extra specifiers at end of group %ld (index %ld)", (long)group, (long)index);
+		return index;
+	}
+
+	PLLog(@"Reference group not found; inserting at end of root list");
+	return [specifiers count];
+}
+
+static NSUInteger PLGroupSectionIndex(PSSpecifier *groupSpecifier, NSArray *specifiers) {
+	NSUInteger groupIndex = 0;
+	for(PSSpecifier *specifier in specifiers) {
+		if(MSHookIvar<NSInteger>(specifier, "cellType") != PSGroupCell)
+			continue;
+		if(specifier == groupSpecifier)
+			break;
+		++groupIndex;
+	}
+	return groupIndex;
+}
 
 /* {{{ iPad Hooks */
 %group iPad
+%hook PrefsListController
 - (NSString *)tableView:(UITableView *)view titleForHeaderInSection:(NSInteger)section {
 	if([_loadedSpecifiers count] == 0) return %orig;
-	if(section == _extraPrefsGroupSectionID) return _Firmware_lt_60 ? @"Extensions" : NULL;
+	if(section == _extraPrefsGroupSectionID) return _Firmware_lt_60 ? @"Extensions" : nil;
 	return %orig;
 }
 
 - (CGFloat)tableView:(UITableView *)view heightForHeaderInSection:(NSInteger)section {
 	if([_loadedSpecifiers count] == 0) return %orig;
-	if(section == _extraPrefsGroupSectionID) return _Firmware_lt_60 ? 22.0f : 10.f;
+	if(section == _extraPrefsGroupSectionID) return _Firmware_lt_60 ? 22.0f : 10.0f;
 	return %orig;
 }
 %end
+%end
 /* }}} */
 
-static NSInteger PSSpecifierSort(PSSpecifier *a1, PSSpecifier *a2, void *context) {
-	NSString *string1 = [a1 name];
-	NSString *string2 = [a2 name];
-	return [string1 localizedCaseInsensitiveCompare:string2];
-}
-
+%hook PrefsListController
 - (id)specifiers {
-	bool first = (MSHookIvar<id>(self, "_specifiers") == nil);
-	if(first) {
-		PLLog(@"initial invocation for -specifiers");
-		%orig;
-		[_loadedSpecifiers release];
-		_loadedSpecifiers = [[NSMutableArray alloc] init];
-		#if SIMULATOR
-		NSArray *subpaths = [[NSFileManager defaultManager] subpathsOfDirectoryAtPath:@"/opt/simject/PreferenceLoader/Preferences" error:NULL];
-		#else
-		NSArray *subpaths = [[NSFileManager defaultManager] subpathsOfDirectoryAtPath:@"/var/jb/Library/PreferenceLoader/Preferences" error:NULL];
-		#endif
-		for(NSString *item in subpaths) {
-			if(![[item pathExtension] isEqualToString:@"plist"]) continue;
-			PLLog(@"processing %@", item);
-			#if SIMULATOR
-			NSString *fullPath = [NSString stringWithFormat:@"/opt/simject/PreferenceLoader/Preferences/%@", item];
-			#else
-			NSString *fullPath = [NSString stringWithFormat:@"/var/jb/Library/PreferenceLoader/Preferences/%@", item];
-			#endif
-			NSDictionary *plPlist = [NSDictionary dictionaryWithContentsOfFile:fullPath];
-			if(![PSSpecifier environmentPassesPreferenceLoaderFilter:[plPlist objectForKey:@"filter"] ?: [plPlist objectForKey:PLFilterKey]]) continue;
+	id origSpecifiers = %orig;
+	if(origSpecifiers == nil)
+		return nil;
 
-			NSDictionary *entry = [plPlist objectForKey:@"entry"];
-			if(!entry) continue;
-			PLLog(@"found an entry key for %@!", item);
+	if(objc_getAssociatedObject(self, PLDidInjectKey))
+		return origSpecifiers;
 
-			if(![PSSpecifier environmentPassesPreferenceLoaderFilter:[entry objectForKey:PLFilterKey]]) continue;
+	if(_UseTopLevelFallbackDetection && !PLLooksLikeTopLevelSettingsController(self)) {
+		PLLog(@"Skipping non top-level controller: %s", class_getName([self class]));
+		return origSpecifiers;
+	}
 
-			NSArray *specs = [self specifiersFromEntry:entry sourcePreferenceLoaderBundlePath:[fullPath stringByDeletingLastPathComponent] title:[[item lastPathComponent] stringByDeletingPathExtension]];
-			if(!specs) continue;
+	objc_setAssociatedObject(self, PLDidInjectKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
-			// But it's possible for there to be more than one with an isController == 0 (PSBundleController) bundle.
-			// so, set all the specifiers to etched mode (if necessary).
-			if(pPSTableCellUseEtchedAppearanceKey && [UIDevice instancesRespondToSelector:@selector(isWildcat)] && [[UIDevice currentDevice] isWildcat])
-				for(PSSpecifier *specifier in specs) {
-					[specifier setProperty:[NSNumber numberWithBool:1] forKey:*pPSTableCellUseEtchedAppearanceKey];
-				}
+	NSMutableArray *workingSpecifiers = nil;
+	if([origSpecifiers isKindOfClass:[NSMutableArray class]]) {
+		workingSpecifiers = (NSMutableArray *)origSpecifiers;
+	} else if([origSpecifiers isKindOfClass:[NSArray class]]) {
+		workingSpecifiers = [origSpecifiers mutableCopy];
+	}
+	if(!workingSpecifiers) {
+		PLLog(@"Unexpected specifiers class: %s", class_getName([origSpecifiers class]));
+		return origSpecifiers;
+	}
 
-			PLLog(@"appending to the array!");
-			[_loadedSpecifiers addObjectsFromArray:specs];
-		}
+	[_loadedSpecifiers release];
+	_loadedSpecifiers = [[PLLoadExtraSpecifiersForController(self) mutableCopy] retain];
+	if(_loadedSpecifiers.count == 0) {
+		if(workingSpecifiers != origSpecifiers)
+			return [workingSpecifiers autorelease];
+		return workingSpecifiers;
+	}
 
-		[_loadedSpecifiers sortUsingFunction:(NSInteger (*)(id, id, void *))&PSSpecifierSort context:NULL];
+	PSSpecifier *groupSpecifier = [PSSpecifier groupSpecifierWithName:_Firmware_lt_60 ? @"Extensions" : nil];
+	[_loadedSpecifiers insertObject:groupSpecifier atIndex:0];
 
-		if([_loadedSpecifiers count] > 0) {
-			PLLog(@"so we gots us some specifiers! that's awesome! let's add them to the list...");
-			PSSpecifier *groupSpecifier = [PSSpecifier groupSpecifierWithName:_Firmware_lt_60 ? @"Extensions" : nil];
-			[_loadedSpecifiers insertObject:groupSpecifier atIndex:0];
-			NSMutableArray *_specifiers = MSHookIvar<NSMutableArray *>(self, "_specifiers");
-			PLLog(@"_specifiers = %@", _specifiers);
-			// Log type
-			PLLog(@"_specifiers type = %s", class_getName([_specifiers class]));
-			if (@available(iOS 18.0, *)) {
-				_specifiers = [_specifiers mutableCopy];
-			}
-			NSInteger group, row;
-			NSInteger firstindex;
-			if ([self getGroup:&group row:&row ofSpecifierID:_Firmware_lt_60 ? @"General" : @"TWITTER"]) {
-				firstindex = [self indexOfGroup:group] + [[self specifiersInGroup:group] count];
-				PLLog(@"Adding to the end of group %ld at index %ld", (long)group, (long)firstindex);
-			} else {
-				firstindex = [_specifiers count];
-				PLLog(@"Adding to the end of entire list");
-			}
-			NSIndexSet *indices = [NSIndexSet indexSetWithIndexesInRange:NSMakeRange(firstindex, [_loadedSpecifiers count])];
-			[_specifiers insertObjects:_loadedSpecifiers atIndexes:indices];
-			if (@available(iOS 18.0, *)) {
-				MSHookIvar<id>(self, "_specifiers") = _specifiers;
-			}
-			PLLog(@"getting group index");
-			NSUInteger groupIndex = 0;
-			for(PSSpecifier *spec in _specifiers) {
-				if(MSHookIvar<NSInteger>(spec, "cellType") != PSGroupCell) continue;
-				if(spec == groupSpecifier) break;
-				++groupIndex;
-			}
-			_extraPrefsGroupSectionID = groupIndex;
-			PLLog(@"group index is %ld", (long)_extraPrefsGroupSectionID);
+	if(@available(iOS 18.0, *)) {
+		NSMutableArray *copiedSpecifiers = [workingSpecifiers mutableCopy];
+		if(workingSpecifiers != origSpecifiers)
+			[workingSpecifiers release];
+		workingSpecifiers = copiedSpecifiers;
+	}
+
+	NSInteger insertionIndex = PLInsertionIndexForController(self, workingSpecifiers);
+	NSIndexSet *indices = [NSIndexSet indexSetWithIndexesInRange:NSMakeRange(insertionIndex, _loadedSpecifiers.count)];
+	[workingSpecifiers insertObjects:_loadedSpecifiers atIndexes:indices];
+
+	if(@available(iOS 18.0, *)) {
+		@try {
+			[self setValue:workingSpecifiers forKey:@"_specifiers"];
+		} @catch (NSException *e) {
+			PLLog(@"Failed to write _specifiers via KVC: %@", e);
 		}
 	}
-	return MSHookIvar<id>(self, "_specifiers");
+
+	_extraPrefsGroupSectionID = (NSInteger)PLGroupSectionIndex(groupSpecifier, workingSpecifiers);
+	PLLog(@"Injected %lu specifiers in %s", (unsigned long)_loadedSpecifiers.count, class_getName([self class]));
+
+	if(workingSpecifiers != origSpecifiers)
+		return [workingSpecifiers autorelease];
+	return workingSpecifiers;
 }
 %end
 
 %ctor {
-	Class targetRootClass = objc_getClass("PSUIPrefsListController");
-	if (targetRootClass == Nil) {
-		targetRootClass = objc_getClass("PrefsListController");
+	static const char * const kRootControllerCandidates[] = {
+		"PSUISettingsRootController",
+		"PSUISettingsListController",
+		"PSUIRootListController",
+		"PSUIPrefsListController",
+		"PrefsListController",
+		"PSGGeneralController",
+		"PSRootController"
+	};
+
+	Class targetRootClass = Nil;
+	for(size_t i = 0; i < sizeof(kRootControllerCandidates) / sizeof(kRootControllerCandidates[0]); ++i) {
+		targetRootClass = objc_getClass(kRootControllerCandidates[i]);
+		if(targetRootClass != Nil) {
+			PLLog(@"Using root controller class %s", kRootControllerCandidates[i]);
+			break;
+		}
 	}
-	if (targetRootClass == Nil) {
-		targetRootClass = objc_getClass("PSGGeneralController");
+
+	if(targetRootClass == Nil) {
+		targetRootClass = objc_getClass("PSListController");
+		_UseTopLevelFallbackDetection = YES;
+		PLLog(@"No known root controller found; falling back to PSListController");
 	}
-	PLLog(@"targetRootClass = %s", class_getName(targetRootClass));
+
+	PLLog(@"targetRootClass = %s", targetRootClass ? class_getName(targetRootClass) : "(null)");
 	%init(PrefsListController = targetRootClass);
 
 	_Firmware_lt_60 = kCFCoreFoundationVersionNumber < 793.00;
 	if(([UIDevice instancesRespondToSelector:@selector(isWildcat)] && [[UIDevice currentDevice] isWildcat]))
-		%init(iPad);
+		%init(iPad, PrefsListController = targetRootClass);
 
 	void *preferencesHandle = dlopen("/System/Library/PrivateFrameworks/Preferences.framework/Preferences", RTLD_LAZY | RTLD_NOLOAD);
 	if(preferencesHandle) {
